@@ -33,11 +33,19 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdio.h>
 #include <winspool.h>
 
+/* Fix 1: Use a writable temp directory for the log file instead of C:\ root,
+   which requires admin privileges on Windows 11 with UAC enabled. */
 #define SLEEP_TIME 5000
-#define LOGFILE "C:\\PrintServer.log"
+
+/* Log file path is now built at runtime using GetTempPath() */
+static char g_logFile[MAX_PATH] = {0};
 
 SERVICE_STATUS ServiceStatus;
 SERVICE_STATUS_HANDLE hStatus;
+
+/* Fix 2: Track whether we are running as a service or standalone so we can
+   choose the correct registry hive (HKCU vs HKLM). */
+static int g_isService = 0;
 
 typedef enum {
   INSTALL = 0,
@@ -61,6 +69,9 @@ struct command {
 #define NUM_COMMANDS (sizeof commands / sizeof *commands)
 
 const char* serviceKey = "System\\CurrentControlSet\\Services\\%s";
+/* Fix 3: Standalone registry is now placed under HKCU (see CreatePrintServer /
+   InnerLoop helpers). The key string itself is reused; only the HKEY root
+   changes depending on g_isService. */
 const char* standaloneKey = "SOFTWARE\\Alexander_Pruss\\RawPrintServer\\%s";
 const char *regKey = serviceKey;
 char printerName[256] = {0};
@@ -73,9 +84,29 @@ void ServiceMain(int argc, char **argv);
 void ControlHandler(DWORD request);
 int InitService();
 
+/* ---------------------------------------------------------------------------
+   Returns the HKEY root appropriate for the current run mode.
+   Services must write to HKLM; standalone runs use HKCU to avoid the UAC
+   elevation requirement imposed by Windows 11 on HKLM writes.
+   --------------------------------------------------------------------------- */
+static HKEY RootKey(void) {
+  return g_isService ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+}
+
+/* Fix 4: Build the log file path once into g_logFile using GetTempPath so
+   that the file is always in a directory the current user can write to. */
+static void InitLogPath(void) {
+  char tempDir[MAX_PATH] = {0};
+  if (GetTempPathA(MAX_PATH, tempDir) == 0)
+    _snprintf(tempDir, MAX_PATH, "C:\\Temp");
+  _snprintf(g_logFile, MAX_PATH, "%sPrintServer.log", tempDir);
+}
+
 int WriteToLog(const char *str) {
   FILE *log;
-  log = fopen(LOGFILE, "a+");
+  if (g_logFile[0] == '\0')
+    return -1;
+  log = fopen(g_logFile, "a+");
   if (log == NULL)
     return -1;
   fprintf(log, "%s\n", str);
@@ -125,23 +156,45 @@ VOID CreatePrintServer(char *strMyPath, char *strPrinter, DWORD port,
     CloseServiceHandle(schService);
   }
 
-  HKEY hdlKey;
+  HKEY hdlKey = NULL;
   sprintf(strTemp, regKey, strServiceName);
+
   if (!service) {
-    RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Alexander_Pruss", 0, "",
+    /* Fix 5: For standalone mode, write under HKCU so no admin rights are
+       needed. Also pass NULL for the lpClass parameter (was "" which is
+       invalid per the RegCreateKeyEx documentation). */
+    RegCreateKeyEx(HKEY_CURRENT_USER, "SOFTWARE\\Alexander_Pruss", 0, NULL,
+                   REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, NULL, NULL);
+    RegCreateKeyEx(HKEY_CURRENT_USER, "SOFTWARE\\Alexander_Pruss\\RawPrintServer", 0, NULL,
                    REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, NULL, NULL);
   }
-  RegCreateKeyEx(HKEY_LOCAL_MACHINE, strTemp, 0, "", REG_OPTION_NON_VOLATILE,
+
+  /* Fix 5 (cont.): Use NULL for lpClass and the correct HKEY root. */
+  RegCreateKeyEx(RootKey(), strTemp, 0, NULL, REG_OPTION_NON_VOLATILE,
                  KEY_ALL_ACCESS, NULL, &hdlKey, NULL);
+
+  if (hdlKey == NULL) {
+    printf("Error: RegCreateKeyEx failed: %d\n", GetLastError());
+    return;
+  }
+
   RegSetValueEx(hdlKey, "Description", 0, REG_SZ,
-                (const unsigned char *)"Routes all traffic from port 910x to a "
-                                       "local printer",
+                (const BYTE *)"Routes all traffic from port 910x to a "
+                               "local printer",
                 53);
-  RegSetValueEx(hdlKey, "Printer", 0, REG_SZ, (const unsigned char *)strPrinter,
-                strlen(strPrinter) + 1);
-  RegSetValueEx(hdlKey, "Port", 0, REG_DWORD, (const unsigned char *)&port,
+  RegSetValueEx(hdlKey, "Printer", 0, REG_SZ, (const BYTE *)strPrinter,
+                (DWORD)(strlen(strPrinter) + 1));
+  RegSetValueEx(hdlKey, "Port", 0, REG_DWORD, (const BYTE *)&port,
                 sizeof(port));
   RegCloseKey(hdlKey);
+
+  /* Also cache the printer name globally so InnerLoop can fall back to it
+     if a subsequent registry read somehow fails. */
+  strncpy(printerName, strPrinter, sizeof(printerName) - 1);
+  printerName[sizeof(printerName) - 1] = '\0';
+
+  printf("Registry configuration saved for printer \"%s\" on port %lu.\n",
+         strPrinter, (unsigned long)port);
 }
 
 VOID DeletePrintServerService(DWORD port) {
@@ -184,20 +237,24 @@ VOID DeletePrintServerService(DWORD port) {
 int main(int argc, char **argv) {
   int command;
 
-  remove(LOGFILE);
+  /* Build writable log path before any WriteToLog calls. */
+  InitLogPath();
 
-  WriteToLog("RawPrintServer 1.00 created by Henk Jonas (www.metaviewsoft.de)");
+  remove(g_logFile);
+
+  WriteToLog("RawPrintServer 1.01 created by Henk Jonas (www.metaviewsoft.de)");
   WriteToLog("PrintServer start");
 
   command = INVALID;
 
   if (1 < argc) {
-    for (command = 0; command < NUM_COMMANDS; command++) {
-      if (0 == stricmp(argv[1], commands[command].commandName))
+    for (command = 0; command < (int)NUM_COMMANDS; command++) {
+      /* Fix 6: _stricmp is the Windows standard; stricmp is deprecated. */
+      if (0 == _stricmp(argv[1], commands[command].commandName))
         break;
     }
 
-    if (NUM_COMMANDS <= command)
+    if ((int)NUM_COMMANDS <= command)
       command = INVALID;
   }
 
@@ -236,6 +293,7 @@ int main(int argc, char **argv) {
 
   switch (command) {
   case INSTALL:
+    g_isService = 1;
     CreatePrintServer(argv[0], argv[2], serverPort, 1);
     break;
   case STANDALONE:
@@ -245,13 +303,21 @@ int main(int argc, char **argv) {
 
     wVersionRequested = MAKEWORD(2, 2);
     regKey = standaloneKey;
+    g_isService = 0;  /* HKCU will be used */
 
     CreatePrintServer(argv[0], argv[2], serverPort, 0);
 
     if (command == BACKGROUND)
       FreeConsole();
 
-    WSAStartup(wVersionRequested, &wsaData);
+    int wsaErr = WSAStartup(wVersionRequested, &wsaData);
+    if (wsaErr != 0) {
+      printf("WSAStartup failed: %d\n", wsaErr);
+      return 1;
+    }
+
+    printf("Listening on port %lu for printer \"%s\". Press Ctrl+C to stop.\n",
+           (unsigned long)serverPort, printerName);
 
     while (InnerLoop(serverPort, 0))
       ;
@@ -263,15 +329,18 @@ int main(int argc, char **argv) {
     DeletePrintServerService(serverPort);
     break;
   case PRIVATE_SERVICE:
-    SERVICE_TABLE_ENTRY ServiceTable[2];
-    ServiceTable[0].lpServiceName = strServiceName;
-    ServiceTable[0].lpServiceProc = (LPSERVICE_MAIN_FUNCTION)ServiceMain;
+    g_isService = 1;
+    {
+      SERVICE_TABLE_ENTRY ServiceTable[2];
+      ServiceTable[0].lpServiceName = strServiceName;
+      ServiceTable[0].lpServiceProc = (LPSERVICE_MAIN_FUNCTION)ServiceMain;
 
-    ServiceTable[1].lpServiceName = NULL;
-    ServiceTable[1].lpServiceProc = NULL;
+      ServiceTable[1].lpServiceName = NULL;
+      ServiceTable[1].lpServiceProc = NULL;
 
-    // Start the control dispatcher thread for our service
-    StartServiceCtrlDispatcher(ServiceTable);
+      // Start the control dispatcher thread for our service
+      StartServiceCtrlDispatcher(ServiceTable);
+    }
 
     WriteToLog("PrintServer exit");
     break;
@@ -290,6 +359,7 @@ int InnerLoop(DWORD port, int service) {
   if (sock == INVALID_SOCKET) {
     sprintf(strTemp, "Error: no socket: %d", WSAGetLastError());
     WriteToLog(strTemp);
+    printf("%s\n", strTemp);
     if (service) {
       ServiceStatus.dwCurrentState = SERVICE_STOPPED;
       ServiceStatus.dwWin32ExitCode = 3;
@@ -297,13 +367,23 @@ int InnerLoop(DWORD port, int service) {
     }
     return 0;
   }
-  sockaddr_in addr = {0};
+
+  /* Allow rapid restart on the same port */
+  BOOL reuseAddr = TRUE;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuseAddr,
+             sizeof(reuseAddr));
+
+  sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(serverPort);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons((u_short)serverPort);
+
   if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    sprintf(strTemp, "Error: couldn't bind: %d", WSAGetLastError());
+    sprintf(strTemp, "Error: couldn't bind to port %lu: %d",
+            (unsigned long)serverPort, WSAGetLastError());
     WriteToLog(strTemp);
+    printf("%s\n", strTemp);
     closesocket(sock);
     if (service) {
       ServiceStatus.dwCurrentState = SERVICE_STOPPED;
@@ -312,53 +392,99 @@ int InnerLoop(DWORD port, int service) {
     }
     return 0;
   }
-  sockaddr_in client = {0};
-  int size = sizeof(client);
-  while (listen(sock, 2) != SOCKET_ERROR) {
-    SOCKET sock2 = accept(sock, (struct sockaddr *)&client, &size);
-    if (sock2 != INVALID_SOCKET) {
-      HANDLE printer = NULL;
 
-      HKEY hdlKey;
-      sprintf(strTemp, regKey, strServiceName);
-      RegOpenKeyEx(HKEY_LOCAL_MACHINE, strTemp, 0, KEY_ALL_ACCESS, &hdlKey);
+  /* Fix 7: Call listen() once before the accept loop, not on every iteration. */
+  if (listen(sock, 5) == SOCKET_ERROR) {
+    sprintf(strTemp, "Error: listen failed: %d", WSAGetLastError());
+    WriteToLog(strTemp);
+    printf("%s\n", strTemp);
+    closesocket(sock);
+    return 0;
+  }
+
+  sockaddr_in client;
+  int clientSize = sizeof(client);
+
+  for (;;) {
+    memset(&client, 0, sizeof(client));
+    clientSize = sizeof(client);
+    SOCKET sock2 = accept(sock, (struct sockaddr *)&client, &clientSize);
+    if (sock2 == INVALID_SOCKET)
+      break;
+
+    HANDLE printer = NULL;
+
+    /* Read the current printer name from the registry (allows hot-reconfiguration). */
+    HKEY hdlKey = NULL;
+    sprintf(strTemp, regKey, strServiceName);
+    if (RegOpenKeyEx(RootKey(), strTemp, 0, KEY_READ, &hdlKey) == ERROR_SUCCESS) {
       valueSize = sizeof(printerName);
       RegQueryValueEx(hdlKey, "Printer", NULL, NULL, (BYTE *)printerName,
                       &valueSize);
       RegCloseKey(hdlKey);
+    }
+    /* If registry read failed, printerName retains the value set at startup. */
 
-      sprintf(
-          strTemp, "Accept print job for %s from %d.%d.%d.%d", printerName,
-          client.sin_addr.S_un.S_un_b.s_b1, client.sin_addr.S_un.S_un_b.s_b2,
-          client.sin_addr.S_un.S_un_b.s_b3, client.sin_addr.S_un.S_un_b.s_b4);
+    sprintf(
+        strTemp, "Accept print job for %s from %d.%d.%d.%d", printerName,
+        client.sin_addr.S_un.S_un_b.s_b1, client.sin_addr.S_un.S_un_b.s_b2,
+        client.sin_addr.S_un.S_un_b.s_b3, client.sin_addr.S_un.S_un_b.s_b4);
+    WriteToLog(strTemp);
+    printf("%s\n", strTemp);
+
+    /* Fix 8: Use char arrays for DOC_INFO_1 string fields to satisfy the
+       non-const LPWSTR/LPSTR requirement without undefined behaviour. */
+    char docName[]  = "Forwarded Job";
+    char dataType[] = "RAW";
+    DOC_INFO_1 info;
+    info.pDocName    = docName;
+    info.pOutputFile = NULL;
+    info.pDatatype   = dataType;
+
+    DWORD jobId = 0;
+    if (!OpenPrinter(printerName, &printer, NULL)) {
+      sprintf(strTemp, "Error opening printer \"%s\": %lu", printerName,
+              (unsigned long)GetLastError());
       WriteToLog(strTemp);
-
-      DOC_INFO_1 info;
-      info.pDocName = "Forwarded Job";
-      info.pOutputFile = NULL;
-      info.pDatatype = "RAW";
-
-      if (!OpenPrinter(printerName, &printer, NULL) ||
-          !StartDocPrinter(printer, 1, (LPBYTE)&info)) {
-        WriteToLog("Error opening print job.");
-      } else {
-        char buffer[1024];
-        DWORD wrote;
-        while (1) {
-          int result = recv(sock2, buffer, sizeof(buffer), 0);
-          if (result <= 0)
-            break;
-          WritePrinter(printer, buffer, result, &wrote);
-          if (wrote != (DWORD)result) {
-            WriteToLog("Couldn't print all data.");
-            break;
-          }
-        }
+      printf("%s\n", strTemp);
+    } else {
+      jobId = StartDocPrinter(printer, 1, (LPBYTE)&info);
+      if (jobId == 0) {
+        sprintf(strTemp, "Error starting print job: %lu",
+                (unsigned long)GetLastError());
+        WriteToLog(strTemp);
+        printf("%s\n", strTemp);
         ClosePrinter(printer);
+        printer = NULL;
       }
     }
+
+    if (printer != NULL && jobId != 0) {
+      char buffer[4096];
+      DWORD wrote;
+      BOOL printOk = TRUE;
+      while (printOk) {
+        int result = recv(sock2, buffer, sizeof(buffer), 0);
+        if (result <= 0)
+          break;
+        if (!WritePrinter(printer, buffer, (DWORD)result, &wrote) ||
+            wrote != (DWORD)result) {
+          WriteToLog("Couldn't print all data.");
+          printf("Couldn't print all data.\n");
+          printOk = FALSE;
+        }
+      }
+      /* Fix 9: EndDocPrinter was missing ¡ª without it the spooler never
+         marks the job as complete and the page may never be ejected. */
+      EndDocPrinter(printer);
+      ClosePrinter(printer);
+      WriteToLog("Print job finished.");
+      printf("Print job finished.\n");
+    }
+
     closesocket(sock2);
   }
+
   if (service) {
     ServiceStatus.dwCurrentState = SERVICE_STOPPED;
     ServiceStatus.dwWin32ExitCode = 5;
@@ -413,16 +539,17 @@ void ServiceMain(int argc, char **argv) {
   wVersionRequested = MAKEWORD(2, 2);
   err = WSAStartup(wVersionRequested, &wsaData);
 
-  HKEY hdlKey;
+  HKEY hdlKey = NULL;
   DWORD valueSize;
   sprintf(strTemp, regKey, strServiceName);
-  RegOpenKeyEx(HKEY_LOCAL_MACHINE, strTemp, 0, KEY_ALL_ACCESS, &hdlKey);
-  valueSize = sizeof(printerName);
-  RegQueryValueEx(hdlKey, "Printer", NULL, NULL, (BYTE *)printerName,
-                  &valueSize);
-  valueSize = sizeof(serverPort);
-  RegQueryValueEx(hdlKey, "Port", NULL, NULL, (BYTE *)&serverPort, &valueSize);
-  RegCloseKey(hdlKey);
+  if (RegOpenKeyEx(RootKey(), strTemp, 0, KEY_READ, &hdlKey) == ERROR_SUCCESS) {
+    valueSize = sizeof(printerName);
+    RegQueryValueEx(hdlKey, "Printer", NULL, NULL, (BYTE *)printerName,
+                    &valueSize);
+    valueSize = sizeof(serverPort);
+    RegQueryValueEx(hdlKey, "Port", NULL, NULL, (BYTE *)&serverPort, &valueSize);
+    RegCloseKey(hdlKey);
+  }
 
   sprintf(strTemp, "%s on %d (%d)", printerName, serverPort, startPort);
   WriteToLog(strTemp);
