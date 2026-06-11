@@ -117,7 +117,9 @@ int WriteToLog(const char *str) {
 VOID CreatePrintServer(char *strMyPath, char *strPrinter, DWORD port,
                        int service) {
   char strTemp[1024];
-  sprintf(strTemp, "\"%s\" PRIVATE_SERVICE %d", strMyPath, port);
+  char modulePath[MAX_PATH];
+  GetModuleFileNameA(NULL, modulePath, MAX_PATH);
+  sprintf(strTemp, "\"%s\" PRIVATE_SERVICE %d", modulePath, port);
 
   if (service) {
     SC_HANDLE schSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
